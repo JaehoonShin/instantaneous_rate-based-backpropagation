@@ -25,10 +25,30 @@ def calcu_rate(x: torch.Tensor, in_spikes_mean: torch.Tensor, in_spikes_var: tor
     rate = gamma * rate_hat + beta
     return rate
 
+@torch.jit.script
+def calcu_rate_mean_and_var(rate: torch.Tensor):
+    in_rate_mean = rate.mean(dim=(0, 2, 3), keepdim=True)
+    in_rate_var = ((rate - in_rate_mean) ** 2).mean(dim=(0, 2, 3), keepdim=True)
+    return in_rate_mean, in_rate_var
+
+
+@torch.jit.script
+def calcu_norm_rate(x: torch.Tensor, in_rate_mean: torch.Tensor, in_rate_var: torch.Tensor, gamma: torch.Tensor,
+               beta: torch.Tensor, eps: float):
+    norm_rate_mean = x.mean(dim=(0, 2, 3), keepdim=True)
+    norm_rate_mean = in_rate_mean.detach() + (norm_rate_mean - norm_rate_mean.detach())
+
+    norm_rate_var = ((x - norm_rate_mean) ** 2).mean(dim=(0, 2, 3), keepdim=True)
+    norm_rate_var = in_rate_var.detach() + (norm_rate_var - norm_rate_var.detach())
+    norm_rate_var = nn.functional.relu(norm_rate_var)
+
+    norm_rate_hat = (x - norm_rate_mean) / torch.sqrt((norm_rate_var + eps))
+    norm_rate = gamma * norm_rate_hat + beta
+    return norm_rate
+
 
 def bn_forward_hook(module, args, output):
     """Batch Normalization 2D"""
-
     # testing stage
     if not module.training:
         return
@@ -52,7 +72,6 @@ def bn_forward_hook(module, args, output):
 
             module.in_spikes_mean = in_spikes_mean
             module.in_spikes_var = in_spikes_var
-
     else:  # rate_prop stage
         if module.step_mode == 's':
             assert len(args[0].shape) == 4
@@ -157,11 +176,14 @@ def init_model(model):
                 module.in_spikes_mean = None
                 module.in_spikes_var = None
                 module.in_spikes_var_recip = None
+                module.in_rate_mean = None
+                module.in_rate_var = None
+                module.in_spikes_var_recip = None
 
 
 def bptt_model_setting(model: nn.Module, **kwargs):
     assert ('time_step' in kwargs and kwargs.get('time_step') > 0) and 'step_mode' in kwargs
-    time_step, step_mode = kwargs.get('time_step'), kwargs.get('step_mode')
+    time_step, step_mode, = kwargs.get('time_step'), kwargs.get('step_mode')
 
     for name, module in model.named_modules():
         setattr(module, 'time_step', time_step)
@@ -172,7 +194,7 @@ def bptt_model_setting(model: nn.Module, **kwargs):
 
 def rate_model_setting(model: nn.Module, **kwargs):
     assert ('time_step' in kwargs and kwargs.get('time_step') > 0) and 'step_mode' in kwargs
-    time_step, step_mode = kwargs.get('time_step'), kwargs.get('step_mode')
+    time_step, step_mode, rate_mode = kwargs.get('time_step'), kwargs.get('step_mode'), kwargs.get('rate_mode')
 
     assert hasattr(model, "readout")
     model.bptt_readout = model.readout
@@ -181,6 +203,7 @@ def rate_model_setting(model: nn.Module, **kwargs):
     for name, module in model.named_modules():
         setattr(module, 'time_step', time_step)
         setattr(module, 'step_mode', step_mode)
+        setattr(module, 'rate_mode', rate_mode)
 
     model.rate_hooks = []
 

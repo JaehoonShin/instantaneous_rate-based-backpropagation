@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from spikingjelly.activation_based import neuron
+import math
 
 
 class CustomEvaluator(torch.nn.Module):
@@ -66,6 +67,7 @@ class LIFLayer(neuron.LIFNode):
         tau = 1.0 / (1.0 - torch.sigmoid(cell_args['decay'])).item()
         super().__init__(tau=tau, decay_input=False, v_threshold=cell_args['thresh'], v_reset=cell_args['v_reset'],
                          detach_reset=cell_args['detach_reset'], step_mode='s')
+        self.sigma = cell_args.get('sigma', 1.0)
         self.register_memory('elig', 0.)
         self.register_memory('elig_factor', 1.0)
         self.register_memory('out_spikes_mean', 0.)
@@ -158,11 +160,19 @@ class LIFLayer(neuron.LIFNode):
             sg, self.elig = self.calcu_sg_and_elig(current_t=t, v=self.v, elig=self.elig, elig_factor=self.elig_factor,
                                                    v_threshold=self.v_threshold)
             self.elig_factor = self.calcu_elig_factor(self.elig_factor, lam, sg, spike)
+            instantaneous_rate = 0.5*torch.erf(self.v_threshold-self.v / (self.sigma * math.sqrt(2.0))) 
 
-            if t == 0:
-                self.out_spikes_mean = spike
+            if self.rate_mode == "P": 
+                # Poisson approxiamation
+                self.out_spikes_mean = instantaneous_rate
+            elif self.rate_mode == "S":
+                # Surrgate gradient
+                self.out_spikes_mean = sg
             else:
-                self.out_spikes_mean = 1. / (t + 1) * (t * self.out_spikes_mean + spike)
+                if t == 0:
+                    self.out_spikes_mean = spike
+                else:
+                    self.out_spikes_mean = 1. / (t + 1) * (t * self.out_spikes_mean + spike)
 
             self.neuronal_reset(spike)
             self.curr_time_step += 1
@@ -175,6 +185,8 @@ class LIFLayer(neuron.LIFNode):
 
             self.reset()
             spikes = []
+            instantaneous_rates = []
+            sgs = []
 
             lam = 1.0 - 1. / self.tau
 
@@ -189,12 +201,24 @@ class LIFLayer(neuron.LIFNode):
                                                        v_threshold=self.v_threshold)
                 elig_factor = self.calcu_elig_factor(elig_factor, lam, sg, spike)
                 spikes.append(spike)
+                sgs.append(sg)
+                instantaneous_rate = 0.5 * torch.erf(self.v_threshold - self.v / (self.sigma * math.sqrt(2.0)))
+                instantaneous_rates.append(instantaneous_rate)
                 self.neuronal_reset(spike)
-            out = torch.cat(spikes, dim=0)
+            
+            
+            if self.rate_mode == "P":
+                out = torch.stack(instantaneous_rates, dim=0)
+            elif self.rate_mode == "S":
+                out = torch.stack(sgs, dim=0)
+            else:
+                out = torch.stack(spikes, dim=0)    
+            #out = torch.cat(spikes, dim=0)
 
             self.out_spikes_mean = out.view(self.time_step, -1, *out.shape[1:]).mean(dim=0)
-            return out
-
+           
+            return torch.stack(spikes, dim=0)  
+        
         elif self.training and torch.is_grad_enabled():
             assert len(x.shape) in (2, 4)
             assert self.elig is not None and self.out_spikes_mean is not None
